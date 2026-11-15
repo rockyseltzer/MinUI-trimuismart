@@ -1,0 +1,107 @@
+# Native (no Docker) cross-compile for trimuismart.
+# There is no reason to use this makefile manually; the top-level makefile calls it.
+#
+# One-time setup: put trimuismart-toolchain.tar.xz in ./toolchains/ and run
+#   make toolchain
+# It extracts to $(TOOLCHAIN_DIR) and relocates the buildroot SDK there.
+
+.PHONY: all shell build toolchain clean
+
+ifeq (,$(PLATFORM))
+$(error please specify PLATFORM, eg. make PLATFORM=trimuismart)
+endif
+
+ifneq ($(PLATFORM),trimuismart)
+$(error the native toolchain is only set up for trimuismart)
+endif
+
+ifneq ($(word 2,$(CURDIR)),)
+$(error the repo path contains a space ($(CURDIR)); move it, the workspace makefiles can't cope)
+endif
+
+TOOLCHAIN_TARBALL ?= $(CURDIR)/toolchains/$(PLATFORM)-toolchain.tar.xz
+TOOLCHAIN_DIR ?= $(CURDIR)/toolchains/$(PLATFORM)-toolchain
+TOOLCHAIN_STAMP = $(TOOLCHAIN_DIR)/.relocated
+EXTRACT_DIR = $(CURDIR)/toolchains/.extract
+
+SYSROOT = $(TOOLCHAIN_DIR)/usr/arm-buildroot-linux-gnueabihf/sysroot
+# Start the workspace build clean, like the old `docker run` did: otherwise the
+# top-level PLATFORM=... leaks into every core's makefile via MAKEFLAGS and
+# overrides their own PLATFORM (e.g. picodrive's PLATFORM = libretro).
+TOOLCHAIN_ENV = \
+	unset MAKEFLAGS MFLAGS MAKEOVERRIDES MAKELEVEL PLATFORM; \
+	export PATH="$(TOOLCHAIN_DIR)/usr/bin:$$PATH:$(SYSROOT)/bin"; \
+	export CROSS_COMPILE="$(TOOLCHAIN_DIR)/usr/bin/arm-buildroot-linux-gnueabihf-"; \
+	export PREFIX="$(SYSROOT)/usr"; \
+	export UNION_PLATFORM=$(PLATFORM);
+
+# The SDK's host binaries (cc1, as, ld, ...) carry RUNPATH=/root/buildroot/
+# output/host/usr/lib from the machine that built it, and relocate-sdk.sh only
+# rewrites text files, so cc1 can't find its bundled libmpfr/libmpc/libgmp.
+# Rewrite each DT_RUNPATH/DT_RPATH string in place to a relative $$ORIGIN path
+# (always shorter, so it fits the existing .dynstr slot). No patchelf needed.
+define RUNPATH_FIX
+import os, struct, sys
+old = b"/root/buildroot/output/host/usr/lib"
+usr = os.path.join(sys.argv[1], "usr"); lib = os.path.join(usr, "lib")
+def offsets(d):
+    if d[:4] != b"\x7fELF" or d[4] != 2 or d[5] != 1: return []
+    shoff, = struct.unpack_from("<Q", d, 0x28)
+    shentsize, shnum = struct.unpack_from("<HH", d, 0x3A)
+    secs = [struct.unpack_from("<IIQQQQIIQQ", d, shoff + i * shentsize) for i in range(shnum)]
+    out = []
+    for s in secs:
+        if s[1] != 6: continue
+        stroff = secs[s[6]][4]
+        for j in range(0, s[5], 16):
+            tag, val = struct.unpack_from("<qQ", d, s[4] + j)
+            if tag == 0: break
+            if tag in (15, 29): out.append(stroff + val)
+    return out
+n = 0
+for sub in ("bin", "sbin", "libexec", "lib"):
+    for dp, _, fs in os.walk(os.path.join(usr, sub)):
+        for f in fs:
+            p = os.path.join(dp, f)
+            if os.path.islink(p) or not os.path.isfile(p): continue
+            d = bytearray(open(p, "rb").read())
+            try: offs = offsets(d)
+            except struct.error: continue
+            rel = os.path.relpath(lib, dp)
+            new = ("$$ORIGIN" if rel == "." else "$$ORIGIN/" + rel).encode()
+            hit = False
+            for o in offs:
+                e = d.index(b"\0", o)
+                if bytes(d[o:e]) == old:
+                    d[o:e] = new + b"\0" * (len(old) - len(new)); hit = True
+            if hit:
+                m = os.stat(p).st_mode; open(p, "wb").write(d); os.chmod(p, m); n += 1
+print("runpath: patched %d file(s)" % n)
+endef
+export RUNPATH_FIX
+
+all: shell
+
+shell: $(TOOLCHAIN_STAMP)
+	@echo "cross-compile shell for $(PLATFORM) (exit to leave)"
+	cd workspace && bash -c '$(TOOLCHAIN_ENV) PS1="($(PLATFORM)) \w\$$ " exec bash --norc -i'
+
+build: $(TOOLCHAIN_STAMP)
+	cd workspace && bash -c '$(TOOLCHAIN_ENV) make'
+
+toolchain: $(TOOLCHAIN_STAMP)
+
+$(TOOLCHAIN_STAMP):
+	@test -f "$(TOOLCHAIN_TARBALL)" || { echo "missing $(TOOLCHAIN_TARBALL) - download it from the toolchain release or your backup"; exit 1; }
+	rm -rf "$(TOOLCHAIN_DIR)" "$(EXTRACT_DIR)"
+	mkdir -p "$(EXTRACT_DIR)"
+	tar -xJf "$(TOOLCHAIN_TARBALL)" -C "$(EXTRACT_DIR)"
+	mv "$(EXTRACT_DIR)/$(PLATFORM)-toolchain" "$(TOOLCHAIN_DIR)"
+	rmdir "$(EXTRACT_DIR)"
+	cd "$(TOOLCHAIN_DIR)" && ./relocate-sdk.sh
+	python3 -c "$$RUNPATH_FIX" "$(TOOLCHAIN_DIR)"
+	"$(TOOLCHAIN_DIR)/usr/bin/arm-buildroot-linux-gnueabihf-gcc" --version | head -1
+	touch "$@"
+
+clean:
+	rm -rf "$(TOOLCHAIN_DIR)"
